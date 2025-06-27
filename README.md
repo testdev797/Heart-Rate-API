@@ -68,9 +68,3 @@ API response example
    "avg_bpm":116.3654074742016
 }
 ```
-## References
-
-- [**Scipy Signal**](https://docs.scipy.org/doc/scipy/reference/signal.html)
-- [**Research Gate**](https://www.researchgate.net/publication/329896875_Image_Analysis_on_Fingertip_Video_To_Obtain_PPG)
-- [**Open CV**](https://docs.opencv.org/3.4/d8/dfe/classcv_1_1VideoCapture.html)
-- [**heart rate ppg camera**](https://www.researchgate.net/publication/329896875_Image_Analysis_on_Fingertip_Video_To_Obtain_PPG)
