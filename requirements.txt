@@ -9,3 +9,4 @@ itsdangerous
 werkzeug
 opencv-python-headless
 wheel
+requests
