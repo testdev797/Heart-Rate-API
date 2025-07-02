@@ -1,4 +1,6 @@
 import json
+import os
+import requests
 from flask import Flask, request
 import cv2
 import numpy as np
@@ -55,9 +57,18 @@ def process_signal(y, order_of_bandpass, high, low, sampling_rate, average_filte
 
 
 def give_bpm(averaged, time_bw_fram):
-    print(time_bw_fram)
+    # Handle case where there are not enough peaks to calculate BPM
+    if len(averaged) < 2:
+        return 0.0
+
     r_min_peak = min(averaged)+(max(averaged)-min(averaged))/16
     r_peaks = find_peaks(averaged, height=r_min_peak)
+    
+    # Handle case where not enough peaks are found
+    if len(r_peaks[0]) < 2:
+        print("Not enough peaks found to calculate BPM.")
+        return 0.0
+
     diff_sum = 0
     total_peaks = len(r_peaks[0])
     i = 0
@@ -68,6 +79,11 @@ def give_bpm(averaged, time_bw_fram):
 
     avg_diff = float(diff_sum/(total_peaks-1))
     avg_time_bw_peaks = float(avg_diff*time_bw_fram)
+    
+    # Avoid division by zero if peaks are too close
+    if avg_time_bw_peaks == 0:
+        return 0.0
+        
     bpm = float(60.0/avg_time_bw_peaks)
     print("Calculated heart rate "+str(bpm))
     return bpm
@@ -75,60 +91,85 @@ def give_bpm(averaged, time_bw_fram):
 
 @app.route('/api', methods=['GET'])
 def get_beats_per_min():
-    # declaring array for storing R,G,B values
+    # --- 1. Get URL and handle missing parameter ---
+    try:
+        video_url = request.args['query']
+    except KeyError:
+        return {"error": "Missing 'query' parameter with the video URL."}, 400
 
-    R = np.array([])
-    G = np.array([])
-    B = np.array([])
+    print(f"Received URL: {video_url}")
+    
+    temp_video_path = "/tmp/temp_video.mp4"
 
-    query_result = request.args['query']
-    query_result = query_result.replace("files/test", "files%2Ftest")
-    token_result = request.args['token']
-    complete_url = query_result+"&token="+token_result
+    # --- 2. Download the video from the URL ---
+    try:
+        response = requests.get(video_url, stream=True)
+        # Raise an HTTPError for bad responses (4xx or 5xx)
+        response.raise_for_status()
+        
+        with open(temp_video_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+                
+    except requests.exceptions.RequestException as e:
+        return {"error": f"Failed to download video from URL. Reason: {e}"}, 400
 
-    print(complete_url)
+    # --- 3. Open the downloaded video file with OpenCV ---
+    video_data = cv2.VideoCapture(temp_video_path)
 
-    # Create a video capture object and read
-    video_data = cv2.VideoCapture(complete_url)
+    # --- 4. CRITICAL: Check if the video was opened successfully ---
+    if not video_data.isOpened():
+        os.remove(temp_video_path) # Clean up the temp file
+        return {"error": "OpenCV could not open the video file. It might be corrupted or in an unsupported format."}, 500
+
+    # --- 5. Get video properties and add ZeroDivisionError check ---
     fps = video_data.get(cv2.CAP_PROP_FPS)
     frame_count = int(video_data.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    if fps == 0:
+        video_data.release()
+        os.remove(temp_video_path)
+        return {"error": "Video has zero FPS or could not be read properly. Cannot process."}, 400
+
     vid_length = frame_count/fps
     time_bw_frame = 1.0/fps
-    
-    print(time_bw_frame)
+
+    # --- 6. Process the video frames ---
+    R, G, B = [], [], []
 
     while True:
         ret, frame = video_data.read()
-
-        if ret == False:
+        if not ret:
             break
 
-        no_of_pixels = 0
-        sumr = 0
-        sumg = 0
-        sumb = 0
+        # Extract the center 100x100 pixel region
+        h, w, _ = frame.shape
+        start_y, start_x = int(h/2) - 50, int(w/2) - 50
+        end_y, end_x = int(h/2) + 50, int(w/2) + 50
+        
+        center_region = frame[start_y:end_y, start_x:end_x]
+        
+        # Calculate average color of the region
+        # BGR is the order for OpenCV
+        avg_color = np.mean(center_region, axis=(0, 1))
+        B.append(avg_color[0])
+        G.append(avg_color[1])
+        R.append(avg_color[2])
 
-        # loop for pixels row, only pixels in mid are selected
-        for i in frame[int((len(frame)-100)/2): int((len(frame)+100)/2)]:
-            # loop for pixel col, only pixels in mid are selected
-            for j in i[int((len(frame[0])-100)/2): int((len(frame[0])+100)/2)]:
-                sumr = sumr+j[2]
-                sumg = sumg+j[1]
-                sumb = sumb+j[0]
-                no_of_pixels = no_of_pixels + 1
-        R = np.append(R, sumr/no_of_pixels)
-        G = np.append(G, sumg/no_of_pixels)
-        B = np.append(B, sumb/no_of_pixels)
+    video_data.release() # Release the video object
 
-    # discarding first few frames and last few
+    # --- 7. Clean up the temporary file ---
+    os.remove(temp_video_path)
 
-    R = R[100:-100]
-    G = G[100:-100]
-    B = B[100:-100]
+    if len(R) < 200:
+        return {"error": f"Video is too short. Needs at least 200 frames for processing, but only found {len(R)}."}, 400
+        
+    # Discarding first few frames and last few
+    R = np.array(R[100:-100])
+    G = np.array(G[100:-100])
+    B = np.array(B[100:-100])
 
-    # R value is choosen for further filtering,bandpassed,squared
-    # declaring filter variables
-
+    # --- 8. Signal processing and BPM calculation ---
     r_cutoff_high = 10
     r_cutoff_low = 100
     r_order_of_bandpass = 5
@@ -137,7 +178,7 @@ def get_beats_per_min():
 
     r_averaged = process_signal(R, r_order_of_bandpass, r_cutoff_high,
                                 r_cutoff_low, r_sampling_rate, r_average_filter_sample_length)
-    g_averaged = process_signal(R, r_order_of_bandpass, r_cutoff_high,
+    g_averaged = process_signal(G, r_order_of_bandpass, r_cutoff_high,
                                 r_cutoff_low, r_sampling_rate, r_average_filter_sample_length)
     b_averaged = process_signal(B, r_order_of_bandpass, r_cutoff_high,
                                 r_cutoff_low, r_sampling_rate, r_average_filter_sample_length)
